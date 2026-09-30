@@ -4,3 +4,13 @@ compatibility_date = "2024-01-01"
 
 [vars]
 ENVIRONMENT = "production"
+UUID = "86c50e3a-5b87-49dd-bd20-03c7f2735e40"
+COUNTRY = "US"
+TOTAL_TRAFFIC = "100"
+EXPIRE_DATE = "2026-12-31"
+
+# Optional: create a D1 database and uncomment/configure this binding.
+# [[d1_databases]]
+# binding = "D1"
+# database_name = "cf-worker-quota"
+# database_id = "replace-with-your-database-id"
