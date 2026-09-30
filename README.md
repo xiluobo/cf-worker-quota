@@ -1,14 +1,13 @@
 # cf-worker-quota
 
-这是一个 Cloudflare Worker VLESS over WebSocket 服务，提供：
+这是一个可直接部署到 Cloudflare Workers 的最小化代理订阅 Worker，适合：
 
-- UUID 鉴权的 VLESS WebSocket TCP 代理
-- 仅用于 DNS 的 UDP over DoH
-- VLESS、Clash Meta、Sing-box 订阅
-- 可选 Cloudflare D1 流量统计与剩余流量显示
-- 环境变量配置与请求输入校验
+- 托管 VLESS 订阅链接
+- 提供 Clash Meta / Sing-box / 通用订阅文件
+- 通过环境变量控制 UUID、国家、流量和过期时间
+- 可选接入 Cloudflare D1 做流量统计
 
-## 部署
+## 安装与部署
 
 ```bash
 npm install
@@ -16,34 +15,41 @@ npx wrangler login
 npm run deploy
 ```
 
-部署后访问：
+## 访问方式
+
+部署后，默认访问：
 
 ```text
-https://<worker-domain>/<UUID>
+https://<your-worker>.workers.dev/
+https://<your-worker>.workers.dev/<UUID>
+https://<your-worker>.workers.dev/<UUID>/ty
+https://<your-worker>.workers.dev/<UUID>/cl
+https://<your-worker>.workers.dev/<UUID>/sb
 ```
 
-订阅端点：`/UUID/ty`、`/UUID/pty`、`/UUID/cl`、`/UUID/pcl`、`/UUID/sb`、`/UUID/psb`。
+## 配置变量
 
-## 配置
+在 Cloudflare Dashboard 中设置环境变量，或在 `wrangler.toml` 中直接声明：
 
-请在 `wrangler.toml` 或 Cloudflare Dashboard 的 Variables 中配置 `UUID`、`COUNTRY`、`TOTAL_TRAFFIC` 和 `EXPIRE_DATE`。生产环境建议使用 Secret 设置 UUID，而不是把真实 UUID 提交到仓库：
-
-```bash
-npx wrangler secret put UUID
+```toml
+[vars]
+UUID = "86c50e3a-5b87-49dd-bd20-03c7f2735e40"
+COUNTRY = "US"
+TOTAL_TRAFFIC = "100"
+EXPIRE_DATE = "2026-12-31"
 ```
 
-`UUID` 支持逗号分隔的多个 UUID。可用 `IP1`–`IP13`、`PT1`–`PT13` 覆盖节点地址和端口，`cdnip` 覆盖首页展示地址。
+生产环境建议用 `wrangler secret put UUID` 保护真实 UUID，而不是把它直接提交到仓库。
 
-## D1 流量统计（可选）
+## D1（可选）
 
-创建数据库并将生成的 `database_id` 写入 `wrangler.toml`，启用 `D1` binding 后 Worker 会自动创建 `traffic` 表并在连接结束时累计流量。也可以提前执行：
+如果你启用 D1 绑定，Worker 会自动在 `traffic` 表中记录用量。配置示例：
 
-```sql
-CREATE TABLE IF NOT EXISTS traffic (
-  uuid TEXT PRIMARY KEY,
-  used_bytes INTEGER NOT NULL DEFAULT 0,
-  updated_at INTEGER NOT NULL
-);
+```toml
+[[d1_databases]]
+binding = "D1"
+database_name = "cf-worker-quota"
+database_id = "<your-database-id>"
 ```
 
 ## 本地开发
@@ -52,4 +58,7 @@ CREATE TABLE IF NOT EXISTS traffic (
 npm run dev
 ```
 
-注意：这是网络代理 Worker，请只为自己控制的客户端和网络使用，并妥善保护 UUID。
+## 注意事项
+
+- 这是网络代理脚本，请务必遵守当地法律法规和 Cloudflare 服务条款。
+- 密钥和真实 UUID 请勿泄露给未授权用户。
