@@ -1,13 +1,14 @@
 {
-  "name": "cf-worker-quota",
-  "version": "1.0.0",
+  "name": "cf-worker-quota-improved",
   "private": true,
+  "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "deploy:prod": "wrangler deploy --env production"
+    "test": "node --test tests/*.test.mjs",
+    "check": "tsc --noEmit"
   },
   "devDependencies": {
-    "wrangler": "^3.114.0"
+    "@cloudflare/workers-types": "5.20260930.1",
+    "miniflare": "5.20260926.1-alpha",
+    "typescript": "7.0.2"
   }
 }
