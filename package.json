@@ -1,0 +1,13 @@
+{
+  "name": "cf-worker-quota",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:prod": "wrangler deploy --env production"
+  },
+  "devDependencies": {
+    "wrangler": "^3.114.0"
+  }
+}
