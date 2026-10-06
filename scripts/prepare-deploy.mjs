@@ -13,7 +13,7 @@ export function buildConfig(settings, account) {
     throw new Error('Configure the original UUID in the Worker environment before deployment.');
   }
   return {
-    name: 'cf-worker-quota', main: '../worker.js', account_id: account,
+    name: 'cf-worker-quota', main: '../src/index.js', account_id: account,
     compatibility_date: '2026-09-30', keep_vars: true,
     ...(settings.compatibility_flags?.length ? { compatibility_flags: settings.compatibility_flags } : {}),
     d1_databases: databases.map(b => ({ binding: b.name, database_id: b.id }))
