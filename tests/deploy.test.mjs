@@ -1,6 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildConfig } from '../scripts/prepare-deploy.mjs';
+import { buildConfig, buildBootstrapConfig, DEPLOY_ENTRY } from '../scripts/prepare-deploy.mjs';
+
+test('deployment entry is the tested quota worker', () => {
+  assert.equal(DEPLOY_ENTRY, '../worker.js');
+});
+
+test('bootstrap config uses the provided D1 database without existing settings', () => {
+  const config = buildBootstrapConfig('account', '11111111-1111-1111-1111-111111111111');
+  assert.equal(config.main, '../worker.js');
+  assert.deepEqual(config.d1_databases, [{ binding: 'D1', database_id: '11111111-1111-1111-1111-111111111111' }]);
+  assert.throws(() => buildBootstrapConfig('account', 'not-a-database-id'), /D1_DATABASE_ID/);
+});
 
 test('deployment preserves database IDs and never writes credentials into config', () => {
   const settings = { bindings: [

@@ -1,6 +1,6 @@
 # cf-worker-quota 改进版
 
-本版基于你提供的 Worker 源码重构。保留 VLESS over WebSocket、13 组节点、六种订阅、国家标签、D1 历史流量；补全流量上限及到期控制。源码为单文件，可粘贴到 Cloudflare Worker 编辑器。
+本版基于你提供的 Worker 源码重构。保留 VLESS over WebSocket、13 组节点、六种订阅、国家标签、D1 历史流量；补全流量上限及到期控制。部署入口为 `worker.js`（测试覆盖的计费版），源码为单文件，可粘贴到 Cloudflare Worker 编辑器。桌面版源码位于 `reference/desktop-version.js`，仅供对照参考，不参与部署。
 
 ## 部署到现有 Worker
 
@@ -9,6 +9,13 @@
 3. 在该 D1 数据库控制台执行 `schema.sql`。它只在表不存在时建表，**不会清空或重置已有记录**。已有原版 `traffic` 表可直接沿用。
 4. 设置下面的环境变量。必须将原来的 UUID 配置为 **UUID 密钥**；新源码没有硬编码账号。UUID 请使用小写并与原 `traffic.uuid` 记录一致，避免形成新的计费记录。
 5. 用 `worker.js` 替换原代码，兼容性日期设为 `2026-09-30`。此 Worker 无第三方运行时依赖，不需要上传测试或安装包。
+
+## 首次部署
+
+如果 `cf-worker-quota` 这个 Worker 还不存在（例如新账号或刚删掉重建），部署脚本读不到现有设置时会直接报错并告诉你缺什么。两种办法：
+
+1. 先在控制台手动建好 Worker：绑定一个 D1 数据库（绑定名 `D1`）、设置 `UUID` 变量，再跑工作流，脚本会沿用已有绑定。
+2. 或者在仓库 Actions variables 里加一个 `D1_DATABASE_ID`（填 D1 数据库的 ID），工作流会用它生成首 deploy 配置；首 deploy 成功后，务必在 Worker 控制台补上 `UUID` 变量，否则无法提供服务。
 6. 发布后，用 Worker 的实际服务域名访问 `https://你的域名/你的UUID`。Cloudflare 管理控制台的 `dash.cloudflare.com` 地址不是订阅地址。
 7. 更新客户端订阅，并先用小流量连接检查计费、DNS 和到期控制。
 
@@ -83,9 +90,10 @@ Clash 配置使用 JSON 表达（JSON 也是合法 YAML），保留自动选择�
 
 在目标仓库配置：
 
-- Actions secret：`CLOUDFLARE_API_TOKEN`，限定到目标账号，具备 Workers Scripts 编辑和 D1 编辑权限。
+- Actions secret：`CLOUDFLARE_API_TOKEN`，限定到目标账号，具备 Workers Scripts 编辑和 D1 编辑权限。**这个 secret 缺失是之前三次运行失败的直接原因**，没它工作流会在准备部署阶段就中止。
 - Actions variable：`CLOUDFLARE_ACCOUNT_ID`，填写现有 Worker 的账号 ID。
-- 现有 Worker 必须已绑定 `D1` 并配置原 `UUID`（或 `uuid`）。
+- Actions variable（仅首次部署需要）：`D1_DATABASE_ID`，见上节“首次部署”。
+- 现有 Worker 必须已绑定 `D1` 并配置原 `UUID`（或 `uuid`），除非走 `D1_DATABASE_ID` 首次部署路线。
 
 工作流读取现有 Worker 设置，生成忽略提交的 `.deploy/wrangler.jsonc`；发现其他未知绑定会中止，避免意外移除资源绑定。保留数据库 ID 和控制台变量，不自动创建替代数据库。然后运行测试、类型检查、dry run、无损建表和部署。成功部署仍需对实际服务域名做客户端验收。
 
