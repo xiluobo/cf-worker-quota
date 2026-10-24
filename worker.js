@@ -1,7 +1,10 @@
 // VLESS over WebSocket; derived from the user-provided GAMFC/43fad05 source.
 // Strict quota mode: persist authorized payload bytes BEFORE forwarding them.
 // UUID and D1 are required. Run schema.sql once before deployment.
-import { connect } from 'cloudflare:sockets';
+// NOTE: cloudflare:sockets is imported lazily inside openSocket only. A static
+// import would fail module evaluation (Error 1101 on every request) on runtimes
+// where the sockets module is unavailable, even for plain HTTP subscription
+// requests that never open a TCP connection.
 
 const GIB = 1024 ** 3;
 const MAX_QUEUE = 2 * 1024 ** 2;
@@ -272,6 +275,9 @@ function openTunnel(request, cfg, db, ctx) {
     }
   }
   async function openSocket(host, port) {
+    // Lazy import: only WebSocket tunnel requests need TCP sockets. HTTP
+    // subscription/page/usage requests must never fail on this import.
+    const { connect } = await import('cloudflare:sockets');
     const candidate = connect({ hostname: host, port });
     socket = candidate;
     void candidate.closed.catch(() => {});

@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 const source = await readFile(new URL('../worker.js', import.meta.url), 'utf8');
-const moduleSource = source.replace("import { connect } from 'cloudflare:sockets';", 'const connect = (...args) => globalThis.__connect(...args);');
+const moduleSource = source.replace("await import('cloudflare:sockets')", "await Promise.resolve({ connect: (...args) => globalThis.__connect(...args) })");
 const mod = await import('data:text/javascript;base64,' + Buffer.from(moduleSource).toString('base64'));
 const worker = mod.default;
 const UUID = '11111111-1111-4111-8111-111111111111';
