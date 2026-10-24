@@ -34,6 +34,32 @@ async function request(e, suffix = '', options = {}) {
   return worker.fetch(new Request('https://worker.example/' + (e.UUID || UUID) + suffix, options), e, context());
 }
 
+test('single-node subscriptions n1-n13 and display names carry live traffic and date', async () => {
+  assert.equal(mod.parseSingleNode('n1'), 0);
+  assert.equal(mod.parseSingleNode('n13'), 12);
+  assert.equal(mod.parseSingleNode('n0'), -1);
+  assert.equal(mod.parseSingleNode('n14'), -1);
+  assert.equal(mod.parseSingleNode('ty'), -1);
+  assert.equal(mod.parseSingleNode(''), -1);
+  const usage = { used: 0, total: 100 * 1024 ** 3, remaining: 100 * 1024 ** 3, expires: Date.parse('2026-12-31T23:59:59.999Z') };
+  assert.equal(mod.displayName({ name: '美国🇺🇸-1' }, usage, usage.expires), '美国🇺🇸-1 | 剩100.00G | 2026-12-31');
+  const e = env();
+  for (const [suffix, index] of [['/n1', 1], ['/n13', 13]]) {
+    const res = await request(e, suffix);
+    assert.equal(res.status, 200, suffix);
+    const links = Buffer.from(await res.text(), 'base64').toString('utf8').split('\n');
+    assert.equal(links.length, 1, suffix);
+    const name = decodeURIComponent(new URL(links[0]).hash.slice(1));
+    assert.ok(name.startsWith('美国🇺🇸-' + index + ' | 剩'), name);
+    assert.ok(name.includes('2099-12-31'), name);
+  }
+  assert.equal((await request(e, '/n0')).status, 404);
+  assert.equal((await request(e, '/n14')).status, 404);
+  const html = await (await request(e)).text();
+  assert.ok(html.includes('/n1') && html.includes('/n13'), 'page lists single-node subscriptions');
+  assert.ok(html.includes('单节点订阅'), 'page has single-node section');
+});
+
 test('configuration is isolated, validates UUID/date/quota and accepts zero', () => {
   const one = mod.readConfig(env({ COUNTRY: 'JP', ip1: 'first.example' }));
   const two = mod.readConfig(env({ UUID: UUID2, COUNTRY: 'US' }));
@@ -66,7 +92,9 @@ test('all six subscriptions generate correct node counts and usage metadata', as
     if (kind.endsWith('ty')) {
       const links = Buffer.from(text, 'base64').toString('utf8').split('\n');
       assert.equal(links.length, count);
-      assert.equal(decodeURIComponent(new URL(links[0]).hash.slice(1)), '美国🇺🇸-' + (kind.startsWith('p') ? 8 : 1));
+      const name = decodeURIComponent(new URL(links[0]).hash.slice(1));
+      assert.ok(name.startsWith('美国🇺🇸-' + (kind.startsWith('p') ? 8 : 1) + ' | 剩'), name);
+      assert.ok(name.includes('2099-12-31'), name);
     } else if (kind.endsWith('cl')) {
       const cfg = JSON.parse(text); assert.equal(cfg.proxies.length, count); assert.equal(cfg['allow-lan'], false);
     } else {

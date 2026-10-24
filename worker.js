@@ -102,6 +102,27 @@ export async function getUsage(db, cfg) {
     expired: Date.now() >= cfg.expires, exhausted: used >= cfg.total };
 }
 
+// Display name for a node: base name + live remaining traffic + expiry date.
+// Computed per request from current usage, so subscription names always reflect
+// the moment of fetch. Node host/port/tls are untouched.
+export function displayName(node, usage, expires) {
+  const remaining = (usage.remaining / GIB).toFixed(2);
+  const date = new Date(expires).toISOString().slice(0, 10);
+  return `${node.name} | 剩${remaining}G | ${date}`;
+}
+
+export function withDisplayNames(nodes, usage, expires) {
+  return nodes.map(n => ({ ...n, name: displayName(n, usage, expires) }));
+}
+
+// Single-node subscription routes: n1..n13 map to node indexes 0..12.
+export function parseSingleNode(kind) {
+  const m = /^n(\d+)$/.exec(kind || '');
+  if (!m) return -1;
+  const i = Number(m[1]);
+  return i >= 1 && i <= DEFAULT_HOSTS.length ? i - 1 : -1;
+}
+
 // Each statement is atomic across concurrent connections and Worker isolates.
 // No automatic retry: an ambiguous write must not accidentally charge twice.
 export async function charge(db, cfg, bytes) {
@@ -125,7 +146,8 @@ export default {
       if (request.method !== 'GET') return response('Method not allowed', 405, undefined, { Allow: 'GET' });
       if (!ws) {
         const parts = url.pathname.split('/');
-        if (parts.length < 2 || parts.length > 3 || !equalUUID(parts[1], cfg.uuid) || !TYPES.has(parts[2] || '')) return response('Not found', 404);
+        const kind = parts[2] || '';
+        if (parts.length < 2 || parts.length > 3 || !equalUUID(parts[1], cfg.uuid) || (!TYPES.has(kind) && parseSingleNode(kind) < 0)) return response('Not found', 404);
       } else if (url.pathname !== '/' && url.pathname !== '/ws') {
         return response('Not found', 404); // Client-supplied ProxyIP overrides are deliberately removed.
       }
@@ -146,8 +168,12 @@ export default {
         'Profile-Update-Interval': '6', 'Profile-Title': 'base64:' + utf8Base64(cfg.country),
         'Profile-Web-Page-Url': url.origin + '/' + cfg.uuid
       };
-      if (!kind) return renderPage(cfg, usage, url.origin);
-      const nodes = cfg.nodes.filter(n => !(cfg.tlsOnly || kind.startsWith('p')) || n.tls);
+      // Display names carry live traffic + expiry; node host/port/tls unchanged.
+      const displayNodes = withDisplayNames(cfg.nodes, usage, cfg.expires);
+      if (!kind) return renderPage(cfg, usage, url.origin, displayNodes);
+      const single = parseSingleNode(kind);
+      if (single >= 0) return response(utf8Base64(vlessURI(cfg, host, displayNodes[single])), 200, undefined, headers);
+      const nodes = displayNodes.filter(n => !(cfg.tlsOnly || kind.startsWith('p')) || n.tls);
       if (kind.endsWith('ty')) return response(utf8Base64(nodes.map(n => vlessURI(cfg, host, n)).join('\n')), 200, undefined, headers);
       if (kind.endsWith('cl')) return response(clashConfig(cfg, host, nodes), 200, 'text/yaml; charset=utf-8', headers);
       return response(JSON.stringify(singboxConfig(cfg, host, nodes), null, 2), 200, 'application/json; charset=utf-8', headers);
@@ -396,7 +422,7 @@ export function singboxConfig(cfg, host, nodes) {
 
 function escapeHTML(value) { return String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]); }
 
-function renderPage(cfg, usage, origin) {
+function renderPage(cfg, usage, origin, displayNodes) {
   const nonce = crypto.randomUUID().replaceAll('-', '');
   const e = escapeHTML;
   const status = usage.expired ? '已到期' : usage.exhausted ? '流量已用尽' : '可用';
@@ -405,10 +431,15 @@ function renderPage(cfg, usage, origin) {
   if (!cfg.tlsOnly) single.push({ host: cfg.cdnip, port: 8880, tls: false, name: cfg.country });
   const fields = [...links.map(([name, suffix]) => [name, origin + '/' + cfg.uuid + '/' + suffix]),
     ...single.map(n => [n.tls ? '单节点 · TLS' : '单节点 · 非 TLS', vlessURI(cfg, new URL(origin).hostname, n)])];
+  const host = new URL(origin).hostname;
+  const nodeFields = (displayNodes || cfg.nodes).map((n, i) => ({
+    name: n.name, sub: origin + '/' + cfg.uuid + '/n' + (i + 1), uri: vlessURI(cfg, host, n)
+  }));
   const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>节点与订阅</title>
   <style nonce="${nonce}">*{box-sizing:border-box}body{font:16px/1.6 system-ui;margin:0;background:#f2f5f9;color:#172437}main{max-width:850px;margin:40px auto;padding:24px}section{background:white;padding:24px;border-radius:16px;margin:18px 0}h1{margin:0}small{color:#526273}label{display:block;margin-top:16px}input{width:calc(100% - 80px);padding:10px;border:1px solid #bcc8d7;border-radius:6px}button{margin-left:8px;padding:10px;border:0;border-radius:6px;background:#145ad3;color:white;cursor:pointer}progress{width:100%;height:18px}#notice{min-height:26px}</style></head>
   <body><main><h1>${e(cfg.country)} · ${status}</h1><section><strong>剩余 ${(usage.remaining / GIB).toFixed(2)} GiB / ${(cfg.total / GIB).toFixed(2)} GiB</strong><progress max="${Math.max(cfg.total,1)}" value="${Math.min(usage.used,cfg.total)}"></progress><p>剩余 ${usage.remainingDays.toFixed(1)} 天 · 到期 ${e(new Date(cfg.expires).toISOString())}</p><small>额度统计上传与下载的有效载荷。请保管好这些链接；其中包含连接凭据。国家名称仅为标签。</small></section>
-  <section><h2>订阅与节点</h2>${fields.map(([name,value],i) => `<label for="link-${i}">${e(name)}</label><input id="link-${i}" readonly value="${e(value)}"><button data-copy="link-${i}">复制</button>`).join('')}<p id="notice" role="status"></p></section></main>
+  <section><h2>订阅与节点</h2>${fields.map(([name,value],i) => `<label for="link-${i}">${e(name)}</label><input id="link-${i}" readonly value="${e(value)}"><button data-copy="link-${i}">复制</button>`).join('')}<p id="notice" role="status"></p></section>
+  <section><h2>单节点订阅</h2><small>每个节点单独订阅，名称含当前剩余流量与到期日。</small>${nodeFields.map((f,i) => `<label for="nsub-${i}">${e(f.name)} · 订阅</label><input id="nsub-${i}" readonly value="${e(f.sub)}"><button data-copy="nsub-${i}">复制</button><label for="nuri-${i}">${e(f.name)} · 节点</label><input id="nuri-${i}" readonly value="${e(f.uri)}"><button data-copy="nuri-${i}">复制</button>`).join('')}</section></main>
   <script nonce="${nonce}">document.addEventListener('click',async event=>{const id=event.target.dataset.copy;if(!id)return;const input=document.getElementById(id);try{await navigator.clipboard.writeText(input.value);document.getElementById('notice').textContent='已复制';}catch{input.focus();input.select();document.getElementById('notice').textContent='请按 Ctrl+C 复制';}});</script></body></html>`;
   return response(html, 200, 'text/html; charset=utf-8', { 'Content-Security-Policy': `default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'` });
 }
