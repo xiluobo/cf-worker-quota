@@ -428,6 +428,201 @@ export function singboxConfig(cfg, host, nodes) {
 
 function escapeHTML(value) { return String(value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]); }
 
+// ---- 本地二维码（QR Model 2，字节模式，纠错等级 L，全程本地算，不请求任何外部服务）----
+// 版本容量（L 级）：[数据码字数, 每块纠错码字数, 块结构 [块数, 每块数据码字数], 对齐坐标]
+/** @type {Array<null | [number, number, Array<[number, number]>, number[]]>} */
+const QR_VERSIONS = [
+  null,
+  [19, 7, [[1, 19]], []],
+  [34, 10, [[1, 34]], [6, 18]],
+  [55, 15, [[1, 55]], [6, 22]],
+  [80, 20, [[1, 80]], [6, 26]],
+  [108, 26, [[1, 108]], [6, 30]],
+  [136, 18, [[2, 68]], [6, 34]],
+  [156, 20, [[2, 78]], [6, 22, 38]],
+  [194, 24, [[2, 97]], [6, 24, 42]],
+  [232, 30, [[2, 116]], [6, 26, 46]],
+  [274, 18, [[2, 68], [2, 69]], [6, 28, 50]],
+];
+const QR_GF_EXP = new Uint8Array(512);
+const QR_GF_LOG = new Uint8Array(256);
+{ let x = 1; for (let i = 0; i < 255; i++) { QR_GF_EXP[i] = x; QR_GF_LOG[x] = i; x <<= 1; if (x & 0x100) x ^= 0x11D; } for (let i = 255; i < 512; i++) QR_GF_EXP[i] = QR_GF_EXP[i - 255]; }
+function qrGFMul(a, b) { return a === 0 || b === 0 ? 0 : QR_GF_EXP[QR_GF_LOG[a] + QR_GF_LOG[b]]; }
+function qrRSDivisor(degree) {
+  const result = new Uint8Array(degree);
+  result[degree - 1] = 1;
+  let root = 1;
+  for (let i = 0; i < degree; i++) {
+    for (let j = 0; j < result.length; j++) {
+      result[j] = qrGFMul(result[j], root);
+      if (j + 1 < result.length) result[j] ^= result[j + 1];
+    }
+    root = qrGFMul(root, 0x02);
+  }
+  return result;
+}
+function qrRSECC(data, degree) {
+  const divisor = qrRSDivisor(degree);
+  const result = new Uint8Array(degree);
+  for (const b of data) {
+    const factor = b ^ result[0];
+    result.copyWithin(0, 1);
+    result[degree - 1] = 0;
+    for (let i = 0; i < degree; i++) result[i] ^= qrGFMul(divisor[i], factor);
+  }
+  return result;
+}
+function qrBCH(value, poly, bits) {
+  let rem = value;
+  for (let i = 0; i < bits; i++) rem = (rem << 1) ^ ((rem >> (bits - 1)) * poly);
+  return rem;
+}
+export function qrEncodeBytes(text) {
+  const bytes = new TextEncoder().encode(text);
+  let version = 0;
+  for (let v = 1; v <= 10; v++) {
+    const lenBits = v <= 9 ? 8 : 16;
+    const bits = 4 + lenBits + bytes.length * 8;
+    if (bits <= QR_VERSIONS[v][0] * 8) { version = v; break; }
+  }
+  if (!version) throw new Error('QR text too long');
+  const [dataLen, ecLen, blocks] = QR_VERSIONS[version];
+  const lenBits = version <= 9 ? 8 : 16;
+  const bits = [];
+  const push = (val, n) => { for (let i = n - 1; i >= 0; i--) bits.push((val >>> i) & 1); };
+  push(0b0100, 4);
+  push(bytes.length, lenBits);
+  for (const b of bytes) push(b, 8);
+  const capacity = dataLen * 8;
+  const term = Math.min(4, capacity - bits.length);
+  for (let i = 0; i < term; i++) bits.push(0);
+  while (bits.length % 8 !== 0) bits.push(0);
+  const data = new Uint8Array(dataLen);
+  for (let i = 0; i < bits.length; i++) data[i >> 3] |= bits[i] << (7 - (i & 7));
+  for (let i = bits.length >> 3; i < dataLen; i++) data[i] = (i - (bits.length >> 3)) % 2 === 0 ? 0xEC : 0x11;
+  // 分块 + 交织
+  const blockData = [];
+  let off = 0;
+  for (const [count, len] of blocks) for (let k = 0; k < count; k++) { blockData.push(data.slice(off, off + len)); off += len; }
+  const blockEC = blockData.map(d => qrRSECC(d, ecLen));
+  const out = [];
+  const maxData = Math.max(...blockData.map(d => d.length));
+  for (let i = 0; i < maxData; i++) for (const d of blockData) if (i < d.length) out.push(d[i]);
+  for (let i = 0; i < ecLen; i++) for (const e of blockEC) out.push(e[i]);
+  return { version, codewords: new Uint8Array(out) };
+}
+function qrBuildMatrix(version, codewords) {
+  const size = 21 + 4 * (version - 1);
+  const mod = Array.from({ length: size }, () => new Array(size).fill(0));
+  const fn = Array.from({ length: size }, () => new Array(size).fill(false));
+  const set = (r, c, v, isFn = true) => { if (r >= 0 && r < size && c >= 0 && c < size) { mod[r][c] = v; fn[r][c] = fn[r][c] || isFn; } };
+  // 定位图案 + 分隔
+  for (const [fr, fc] of [[0, 0], [0, size - 7], [size - 7, 0]]) {
+    for (let dr = -1; dr <= 7; dr++) for (let dc = -1; dc <= 7; dc++) {
+      const r = fr + dr, c = fc + dc;
+      if (r < 0 || r >= size || c < 0 || c >= size) continue;
+      const inFinder = dr >= 0 && dr <= 6 && dc >= 0 && dc <= 6;
+      const v = inFinder && (dr === 0 || dr === 6 || dc === 0 || dc === 6 || (dr >= 2 && dr <= 4 && dc >= 2 && dc <= 4)) ? 1 : 0;
+      set(r, c, v);
+    }
+  }
+  // 时序
+  for (let i = 8; i < size - 8; i++) { set(6, i, i % 2 === 0 ? 1 : 0); set(i, 6, i % 2 === 0 ? 1 : 0); }
+  // 对齐（只跳过三个定位图案角，其余即使压在时序线上也要画）
+  const align = QR_VERSIONS[version][3];
+  for (let i = 0; i < align.length; i++) for (let j = 0; j < align.length; j++) {
+    if ((i === 0 && j === 0) || (i === 0 && j === align.length - 1) || (i === align.length - 1 && j === 0)) continue;
+    const r = align[i], c = align[j];
+    for (let dr = -2; dr <= 2; dr++) for (let dc = -2; dc <= 2; dc++)
+      set(r + dr, c + dc, (Math.max(Math.abs(dr), Math.abs(dc)) !== 1) ? 1 : 0);
+  }
+  // 格式信息占位（行列按规范：竖直在第 8 列、水平在第 8 行；暗模块在 (size-8, 8)，不与格式位重叠）
+  for (let i = 0; i <= 5; i++) set(i, 8, 0);
+  set(7, 8, 0); set(8, 8, 0); set(8, 7, 0);
+  for (let i = 9; i < 15; i++) set(8, 14 - i, 0);
+  for (let i = 0; i < 8; i++) set(8, size - 1 - i, 0);
+  for (let i = 8; i < 15; i++) set(size - 15 + i, 8, 0);
+  set(size - 8, 8, 1);
+  // 版本信息（v>=7）
+  if (version >= 7) {
+    const rem = qrBCH(version, 0x1F25, 12);
+    const bits = (version << 12) | rem;
+    for (let i = 0; i < 18; i++) {
+      const bit = (bits >>> i) & 1;
+      set(i / 3 | 0, size - 11 + i % 3, bit);
+      set(size - 11 + i % 3, i / 3 | 0, bit);
+    }
+  }
+  // 数据区（之字形）
+  let bitIdx = 0;
+  const totalBits = codewords.length * 8;
+  for (let right = size - 1; right >= 1; right -= 2) {
+    if (right === 6) right = 5;
+    const upward = ((right + 1) & 2) === 0;
+    for (let vert = 0; vert < size; vert++) {
+      for (let j = 0; j < 2; j++) {
+        const c = right - j;
+        const r = upward ? size - 1 - vert : vert;
+        if (!fn[r][c] && bitIdx < totalBits) {
+          mod[r][c] = (codewords[bitIdx >> 3] >>> (7 - (bitIdx & 7))) & 1;
+          bitIdx++;
+        }
+      }
+    }
+  }
+  return { size, mod, fn };
+}
+function qrMaskBit(mask, r, c) {
+  switch (mask) {
+    case 0: return (r + c) % 2 === 0;
+    case 1: return r % 2 === 0;
+    case 2: return c % 3 === 0;
+    case 3: return (r + c) % 3 === 0;
+    case 4: return (Math.floor(r / 2) + Math.floor(c / 3)) % 2 === 0;
+    case 5: return ((r * c) % 2 + (r * c) % 3) === 0;
+    case 6: return (((r * c) % 2 + (r * c) % 3) % 2) === 0;
+    default: return (((r + c) % 2 + (r * c) % 3) % 2) === 0;
+  }
+}
+function qrApplyFormat(mod, size, mask) {
+  const data = (0b01 << 3) | mask;
+  const rem = qrBCH(data, 0x537, 10);
+  const bits = ((data << 10) | rem) ^ 0x5412;
+  const bit = i => (bits >>> i) & 1;
+  const set = (r, c, v) => { mod[r][c] = v; };
+  for (let i = 0; i <= 5; i++) set(i, 8, bit(i));
+  set(7, 8, bit(6)); set(8, 8, bit(7)); set(8, 7, bit(8));
+  for (let i = 9; i < 15; i++) set(8, 14 - i, bit(i));
+  for (let i = 0; i < 8; i++) set(8, size - 1 - i, bit(i));
+  for (let i = 8; i < 15; i++) set(size - 15 + i, 8, bit(i));
+}
+export function qrMatrix(text) {
+  const { version, codewords } = qrEncodeBytes(text);
+  const { size, mod, fn } = qrBuildMatrix(version, codewords);
+  const mask = 0;
+  const m = mod.map(row => row.slice());
+  for (let r = 0; r < size; r++) for (let c = 0; c < size; c++)
+    if (!fn[r][c] && qrMaskBit(mask, r, c)) m[r][c] ^= 1;
+  qrApplyFormat(m, size, mask);
+  return { size, rows: m.map(row => row.join('')) };
+}
+export function qrToSVG(text, px = 160) {
+  const { size, rows } = qrMatrix(text);
+  const total = size + 8;
+  let path = '';
+  for (let r = 0; r < size; r++) {
+    let c = 0;
+    while (c < size) {
+      if (rows[r][c] !== '1') { c++; continue; }
+      let len = 1;
+      while (c + len < size && rows[r][c + len] === '1') len++;
+      path += `M${c + 4} ${r + 4}h${len}v1H${c + 4}z`;
+      c += len;
+    }
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${px}" height="${px}" viewBox="0 0 ${total} ${total}" shape-rendering="crispEdges"><rect width="${total}" height="${total}" fill="#fff"/><path d="${path}" fill="#000"/></svg>`;
+}
+
 function renderPage(cfg, usage, origin, displayNodes) {
   const nonce = crypto.randomUUID().replaceAll('-', '');
   const e = escapeHTML;
@@ -435,17 +630,17 @@ function renderPage(cfg, usage, origin, displayNodes) {
   const links = [['通用订阅', 'ty'], ['Clash Meta', 'cl'], ['Sing-box', 'sb'], ['通用订阅 · 仅 TLS', 'pty'], ['Clash Meta · 仅 TLS', 'pcl'], ['Sing-box · 仅 TLS', 'psb']];
   const single = [{ host: cfg.cdnip, port: 8443, tls: true, name: cfg.country }];
   if (!cfg.tlsOnly) single.push({ host: cfg.cdnip, port: 8880, tls: false, name: cfg.country });
-  const fields = [...links.map(([name, suffix]) => [name, origin + '/' + cfg.uuid + '/' + suffix]),
-    ...single.map(n => [n.tls ? '单节点 · TLS' : '单节点 · 非 TLS', vlessURI(cfg, new URL(origin).hostname, n)])];
+  const subFields = links.map(([name, suffix]) => [name, origin + '/' + cfg.uuid + '/' + suffix]);
+  const uriFields = single.map(n => [n.tls ? '单节点 · TLS' : '单节点 · 非 TLS', vlessURI(cfg, new URL(origin).hostname, n)]);
   const host = new URL(origin).hostname;
   const nodeFields = (displayNodes || cfg.nodes).map((n, i) => ({
     name: n.name, sub: origin + '/' + cfg.uuid + '/n' + (i + 1), uri: vlessURI(cfg, host, n)
   }));
   const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>节点与订阅</title>
-  <style nonce="${nonce}">*{box-sizing:border-box}body{font:16px/1.6 system-ui;margin:0;background:#f2f5f9;color:#172437}main{max-width:850px;margin:40px auto;padding:24px}section{background:white;padding:24px;border-radius:16px;margin:18px 0}h1{margin:0}small{color:#526273}label{display:block;margin-top:16px}input{width:calc(100% - 80px);padding:10px;border:1px solid #bcc8d7;border-radius:6px}button{margin-left:8px;padding:10px;border:0;border-radius:6px;background:#145ad3;color:white;cursor:pointer}progress{width:100%;height:18px}#notice{min-height:26px}</style></head>
+  <style nonce="${nonce}">*{box-sizing:border-box}body{font:16px/1.6 system-ui;margin:0;background:#f2f5f9;color:#172437}main{max-width:850px;margin:40px auto;padding:24px}section{background:white;padding:24px;border-radius:16px;margin:18px 0}h1{margin:0}small{color:#526273}label{display:block;margin-top:16px}input{width:calc(100% - 80px);padding:10px;border:1px solid #bcc8d7;border-radius:6px}button{margin-left:8px;padding:10px;border:0;border-radius:6px;background:#145ad3;color:white;cursor:pointer}progress{width:100%;height:18px}#notice{min-height:26px}details{margin:8px 0}summary{cursor:pointer;color:#145ad3}details svg{display:block;margin:10px 0}</style></head>
   <body><main><h1>${e(cfg.country)} · ${status}</h1><section><strong>剩余 ${(usage.remaining / GIB).toFixed(2)} GiB / ${(cfg.total / GIB).toFixed(2)} GiB</strong><progress max="${Math.max(cfg.total,1)}" value="${Math.min(usage.used,cfg.total)}"></progress><p>剩余 ${usage.remainingDays.toFixed(1)} 天 · 到期 ${e(new Date(cfg.expires).toISOString())}</p><small>额度统计上传与下载的有效载荷。请保管好这些链接；其中包含连接凭据。国家名称仅为标签。</small></section>
-  <section><h2>订阅与节点</h2>${fields.map(([name,value],i) => `<label for="link-${i}">${e(name)}</label><input id="link-${i}" readonly value="${e(value)}"><button data-copy="link-${i}">复制</button>`).join('')}<p id="notice" role="status"></p></section>
-  <section><h2>单节点订阅</h2><small>每个节点单独订阅，名称含当前剩余流量与到期日。</small>${nodeFields.map((f,i) => `<label for="nsub-${i}">${e(f.name)} · 订阅</label><input id="nsub-${i}" readonly value="${e(f.sub)}"><button data-copy="nsub-${i}">复制</button><label for="nuri-${i}">${e(f.name)} · 节点</label><input id="nuri-${i}" readonly value="${e(f.uri)}"><button data-copy="nuri-${i}">复制</button>`).join('')}</section></main>
+  <section><h2>订阅与节点</h2>${subFields.map(([name,value],i) => `<label for="link-${i}">${e(name)}</label><input id="link-${i}" readonly value="${e(value)}"><button data-copy="link-${i}">复制</button><details><summary>二维码</summary>${qrToSVG(value)}</details>`).join('')}${uriFields.map(([name,value],i) => `<label for="uri-${i}">${e(name)}</label><input id="uri-${i}" readonly value="${e(value)}"><button data-copy="uri-${i}">复制</button>`).join('')}<p id="notice" role="status"></p></section>
+  <section><h2>单节点订阅</h2><small>每个节点单独订阅，名称含当前剩余流量与到期日。</small>${nodeFields.map((f,i) => `<label for="nsub-${i}">${e(f.name)} · 订阅</label><input id="nsub-${i}" readonly value="${e(f.sub)}"><button data-copy="nsub-${i}">复制</button><details><summary>二维码</summary>${qrToSVG(f.sub)}</details><label for="nuri-${i}">${e(f.name)} · 节点</label><input id="nuri-${i}" readonly value="${e(f.uri)}"><button data-copy="nuri-${i}">复制</button>`).join('')}</section></main>
   <script nonce="${nonce}">document.addEventListener('click',async event=>{const id=event.target.dataset.copy;if(!id)return;const input=document.getElementById(id);try{await navigator.clipboard.writeText(input.value);document.getElementById('notice').textContent='已复制';}catch{input.focus();input.select();document.getElementById('notice').textContent='请按 Ctrl+C 复制';}});</script></body></html>`;
   return response(html, 200, 'text/html; charset=utf-8', { 'Content-Security-Policy': `default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'` });
 }
