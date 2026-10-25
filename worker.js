@@ -105,17 +105,15 @@ export async function getUsage(db, cfg) {
     expired: Date.now() >= cfg.expires, exhausted: used >= cfg.total };
 }
 
-// Display name for a node: base name + live remaining traffic + expiry date.
-// Computed per request from current usage, so subscription names always reflect
-// the moment of fetch. Node host/port/tls are untouched.
-export function displayName(node, usage, expires) {
-  const remaining = (usage.remaining / GIB).toFixed(2);
-  const date = new Date(expires).toISOString().slice(0, 10);
-  return `${node.name} | 剩${remaining}G | ${date}`;
+// Display name for a node: plain country-flag base name only.
+// Traffic and expiry used to be appended, but that made subscription names
+// stale and noisy; the page status section still shows live quota.
+export function displayName(node) {
+  return node.name;
 }
 
-export function withDisplayNames(nodes, usage, expires) {
-  return nodes.map(n => ({ ...n, name: displayName(n, usage, expires) }));
+export function withDisplayNames(nodes) {
+  return nodes.map(n => ({ ...n, name: displayName(n) }));
 }
 
 // Single-node subscription routes: n1..n13 map to node indexes 0..12.
@@ -168,11 +166,11 @@ export default {
       const headers = {
         // Legacy usage has no directional split. Report its aggregate as download.
         'Subscription-Userinfo': `upload=0; download=${usage.used}; total=${cfg.total}; expire=${Math.floor(cfg.expires / 1000)}`,
-        'Profile-Update-Interval': '6', 'Profile-Title': 'base64:' + utf8Base64(cfg.country),
+        'Profile-Update-Interval': '6', 'Profile-Title': 'base64:' + utf8Base64(cfg.country + ' | 剩' + (usage.remaining / GIB).toFixed(2) + 'G | ' + new Date(cfg.expires).toISOString().slice(0, 10)),
         'Profile-Web-Page-Url': url.origin + '/' + cfg.uuid
       };
-      // Display names carry live traffic + expiry; node host/port/tls unchanged.
-      const displayNodes = withDisplayNames(cfg.nodes, usage, cfg.expires);
+      // Node names are plain country-flag names; node host/port/tls unchanged.
+      const displayNodes = withDisplayNames(cfg.nodes);
       if (!kind) return renderPage(cfg, usage, url.origin, displayNodes);
       const single = parseSingleNode(kind);
       if (single >= 0) return response(utf8Base64(vlessURI(cfg, host, displayNodes[single])), 200, undefined, headers);
