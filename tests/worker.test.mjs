@@ -34,7 +34,7 @@ async function request(e, suffix = '', options = {}) {
   return worker.fetch(new Request('https://worker.example/' + (e.UUID || UUID) + suffix, options), e, context());
 }
 
-test('single-node subscriptions n1-n13 and display names carry live traffic and date', async () => {
+test('single-node subscriptions n1-n13 use plain country-flag names', async () => {
   assert.equal(mod.parseSingleNode('n1'), 0);
   assert.equal(mod.parseSingleNode('n13'), 12);
   assert.equal(mod.parseSingleNode('n0'), -1);
@@ -42,7 +42,7 @@ test('single-node subscriptions n1-n13 and display names carry live traffic and 
   assert.equal(mod.parseSingleNode('ty'), -1);
   assert.equal(mod.parseSingleNode(''), -1);
   const usage = { used: 0, total: 100 * 1024 ** 3, remaining: 100 * 1024 ** 3, expires: Date.parse('2026-12-31T23:59:59.999Z') };
-  assert.equal(mod.displayName({ name: '美国🇺🇸-1' }, usage, usage.expires), '美国🇺🇸-1 | 剩100.00G | 2026-12-31');
+  assert.equal(mod.displayName({ name: '美国🇺🇸-1' }), '美国🇺🇸-1');
   const e = env();
   for (const [suffix, index] of [['/n1', 1], ['/n13', 13]]) {
     const res = await request(e, suffix);
@@ -50,8 +50,7 @@ test('single-node subscriptions n1-n13 and display names carry live traffic and 
     const links = Buffer.from(await res.text(), 'base64').toString('utf8').split('\n');
     assert.equal(links.length, 1, suffix);
     const name = decodeURIComponent(new URL(links[0]).hash.slice(1));
-    assert.ok(name.startsWith('美国🇺🇸-' + index + ' | 剩'), name);
-    assert.ok(name.includes('2099-12-31'), name);
+    assert.equal(name, '美国🇺🇸-' + index);
   }
   assert.equal((await request(e, '/n0')).status, 404);
   assert.equal((await request(e, '/n14')).status, 404);
@@ -86,6 +85,8 @@ test('all six subscriptions generate correct node counts and usage metadata', as
     const res = await request(e, '/' + kind);
     assert.equal(res.status, 200, kind);
     assert.match(res.headers.get('Subscription-Userinfo'), /upload=0; download=0; total=1073741824;/);
+    const title = Buffer.from(res.headers.get('Profile-Title').replace('base64:', ''), 'base64').toString('utf8');
+    assert.equal(title, '美国🇺🇸 | 剩1.00G | 2099-12-31', 'subscription title carries flag, live remaining traffic and date');
     assert.equal(res.headers.get('Cache-Control'), 'no-store');
     const text = await res.text();
     const count = kind.startsWith('p') ? 6 : 13;
@@ -93,8 +94,7 @@ test('all six subscriptions generate correct node counts and usage metadata', as
       const links = Buffer.from(text, 'base64').toString('utf8').split('\n');
       assert.equal(links.length, count);
       const name = decodeURIComponent(new URL(links[0]).hash.slice(1));
-      assert.ok(name.startsWith('美国🇺🇸-' + (kind.startsWith('p') ? 8 : 1) + ' | 剩'), name);
-      assert.ok(name.includes('2099-12-31'), name);
+      assert.equal(name, '美国🇺🇸-' + (kind.startsWith('p') ? 8 : 1));
     } else if (kind.endsWith('cl')) {
       const cfg = JSON.parse(text); assert.equal(cfg.proxies.length, count); assert.equal(cfg['allow-lan'], false);
     } else {
