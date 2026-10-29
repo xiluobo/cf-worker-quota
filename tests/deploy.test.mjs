@@ -22,6 +22,8 @@ test('deployment preserves database IDs and never writes credentials into config
   ]};
   const config = buildConfig(settings, 'account');
   assert.equal(config.keep_vars,true);
+  assert.equal(config.observability.enabled, true);
+  assert.equal(buildBootstrapConfig('account', '11111111-1111-1111-1111-111111111111').observability.enabled, true);
   assert.deepEqual(config.d1_databases.map(b=>b.database_id),['original-database','other-database']);
   assert.equal(config.vars,undefined);
   assert.throws(()=>buildConfig({bindings:[]},'account'),/D1/);
