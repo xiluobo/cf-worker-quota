@@ -21,6 +21,14 @@ test('real workerd serves all subscriptions and D1 prevents concurrent overrun',
     d1Databases: ['D1'] }));
   try {
     const db = await mf.getD1Database('D1');
+    const missingTable = await mf.dispatchFetch('https://worker.example/' + UUID);
+    assert.equal(missingTable.status, 503);
+    assert.match(await missingTable.text(), /schema\.sql/);
+    const qr = await mf.dispatchFetch('https://worker.example/' + UUID + '/qr/n1');
+    assert.equal(qr.status, 200, 'qr does not need D1');
+    assert.match(qr.headers.get('content-type') || '', /image\/svg\+xml/);
+    assert.match(await qr.text(), /^<svg /);
+    assert.equal((await mf.dispatchFetch('https://worker.example/' + UUID + '/qr/usage')).status, 404);
     await db.prepare('CREATE TABLE traffic (uuid TEXT PRIMARY KEY, used_bytes INTEGER DEFAULT 0, updated_at INTEGER)').run();
     for (const path of ['', '/ty', '/pty', '/cl', '/pcl', '/sb', '/psb', '/usage']) {
       const res = await mf.dispatchFetch('https://worker.example/' + UUID + path);
@@ -34,13 +42,18 @@ test('real workerd serves all subscriptions and D1 prevents concurrent overrun',
     assert.equal(row.used_bytes,100);
     const usage = await (await mf.dispatchFetch('https://worker.example/'+UUID+'/usage')).json();
     assert.equal(usage.used,100);
+    const head = await mf.dispatchFetch('https://worker.example/' + UUID + '/usage', { method: 'HEAD' });
+    assert.equal(head.status, 200);
+    assert.equal(await head.text(), '');
+    assert.equal((await mf.dispatchFetch('https://worker.example/' + UUID, { method: 'POST' })).status, 405);
     const wsResponse = await mf.dispatchFetch('https://worker.example/', {headers:{Upgrade:'websocket'}});
     assert.equal(wsResponse.status,101);
     const ws = wsResponse.webSocket;
     ws.accept();
     const closed = new Promise(resolve=>ws.addEventListener('close',resolve,{once:true}));
-    // Invalid VLESS UUID must close the socket without touching a destination.
+    // Invalid VLESS UUID must be parsed (not rejected as a Blob/text frame) and closed.
     ws.send(new Uint8Array(24));
-    await closed;
+    const event = await closed;
+    assert.equal(event.code, 1008);
   } finally { await mf.dispose(); }
 });

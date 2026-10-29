@@ -54,7 +54,7 @@
 | `/UUID/qr/<ty\|cl\|sb\|pty\|pcl\|psb\|n1…n13>` | 对应订阅链接的二维码（SVG），展示页按需懒加载，不访问 D1 |
 | `/` 或 `/ws` + WebSocket Upgrade | 代理连接入口，使用协议内 UUID 验证；原 `/?ed=2560` 路径继续支持 |
 
-节点名称含实时流量与到期日：每次拉取订阅时，节点名按当时用量现算，格式为 `国家-序号 | 剩xx.xxG | 到期日`，例如 `美国🇺🇸-1 | 剩45.23G | 2026-12-31`。单节点订阅和六种组合订阅的节点名都带这个格式。展示页的"单节点订阅"区列出全部 13 个节点各自的订阅链接和节点直链。
+节点名称是国家标签加序号（例如 `美国🇺🇸-1`），不把剩余流量写进节点名，避免订阅名过期。剩余流量和到期日在展示页，以及订阅响应的 `Profile-Title`（格式 `国家 | 剩xx.xxG | 到期日`）。展示页的「单节点订阅」区列出全部 13 个节点各自的订阅链接和节点直链。
 
 普通根路径和未知路径返回 404，不再公开 `request.cf`。订阅链接包含连接凭据，请仅分享给允许使用该节点的人。
 
@@ -68,7 +68,7 @@ Clash 配置使用 JSON 表达（JSON 也是合法 YAML），保留自动选择�
   - `D1 table "traffic" is missing; run schema.sql ...` → 在该数据库控制台执行 `schema.sql`；
   - `Invalid EXPIRE_DATE` / `Invalid TOTAL_TRAFFIC` 等 → 修正对应变量。
 - 未预期的错误会以 JSON（含 stack，不含 UUID）写入 Workers Logs；部署脚本已开启 `observability`。也可用 `npx wrangler tail cf-worker-quota` 实时查看。
-- 如果仍看到 1101：说明访问的不是本仓库最新部署（例如控制台手动粘贴的旧代码、另一个账号下的同名 Worker，或自定义域名路由指向了别的 Worker）。工作流在未设置 `CLOUDFLARE_ACCOUNT_ID` 变量时会回退到写死的账号 ID，请确认它就是你访问的那个账号。
+- 如果仍看到 1101：说明访问的不是本仓库最新部署（例如控制台手动粘贴的旧代码、另一个账号下的同名 Worker，或自定义域名路由指向了别的 Worker）。工作流在 `CLOUDFLARE_ACCOUNT_ID` 缺失或不是 32 位账号 ID 时会直接失败，不再回退到写死的账号，避免把新代码部署到别的账号、而你访问的 Worker 仍是旧代码。
 - 兼容性日期 ≥ 2026-03-17 时，Workers 默认把 WebSocket 二进制帧作为 `Blob` 交付；本 Worker 已在 `accept()` 前设置 `binaryType = 'arraybuffer'` 并兼容 `Blob`，否则代理连接会被立即以 1003 关闭。
 
 ## 配额与计费口径
@@ -106,7 +106,7 @@ Clash 配置使用 JSON 表达（JSON 也是合法 YAML），保留自动选择�
 在目标仓库配置：
 
 - Actions secret：`CLOUDFLARE_API_TOKEN`，限定到目标账号，具备 Workers Scripts 编辑和 D1 编辑权限。**这个 secret 缺失是之前三次运行失败的直接原因**，没它工作流会在准备部署阶段就中止。
-- Actions variable：`CLOUDFLARE_ACCOUNT_ID`，填写现有 Worker 的账号 ID。
+- Actions variable：`CLOUDFLARE_ACCOUNT_ID`，填写用户实际访问的那个账号的 32 位 ID。未设置时工作流会失败，不会再回退到仓库里曾经写死的账号。
 - Actions variable（仅首次部署需要）：`D1_DATABASE_ID`，见上节“首次部署”。
 - 现有 Worker 必须已绑定 `D1` 并配置原 `UUID`（或 `uuid`），除非走 `D1_DATABASE_ID` 首次部署路线。
 
@@ -121,6 +121,8 @@ npm install
 npm test
 npm run check
 ```
+
+本地 `wrangler dev` 需要自带 workerd 支持兼容性日期 `2026-09-30` 的 Wrangler。CI 里固定的 `wrangler@4.119.0` 可以 `deploy --dry-run`，但它的 workerd 只支持到 `2026-08-08`，不能把这份 Worker 跑起来。`npx wrangler@4.155.0 dev` 可以。
 
 `tests/worker.test.mjs` 使用真实 SQLite 执行计费 SQL，并模拟 sockets/WebSocket 验证连接生命周期。
 `tests/runtime.test.mjs` 使用 Miniflare/workerd 验证真实 Workers 运行时、D1 绑定、六种订阅和 WebSocket 鉴权。

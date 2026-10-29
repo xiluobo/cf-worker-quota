@@ -5,6 +5,10 @@
 // HTTP routes never depend on it. The fetch handler catches every error and
 // returns a clear 4xx/5xx text response; unexpected errors are logged with a
 // stack trace to Workers Logs instead of surfacing as Cloudflare error 1101.
+// compatibility_date >= 2026-09-15 reports exceptions thrown by WebSocket and
+// abort listeners instead of propagating them (spec_compliant_dispatch_exceptions).
+// Those reported exceptions are uncaught and can still become error 1101, so
+// listeners and timers must not throw.
 
 const GIB = 1024 ** 3;
 const MAX_QUEUE = 2 * 1024 ** 2;
@@ -138,32 +142,58 @@ export async function charge(db, cfg, bytes) {
   if (!row) throw new PublicError('Quota exhausted', 403);
 }
 
-// Map storage failures to clear, non-secret messages. Anything else stays generic.
-function storageError(error) {
-  const text = String(error?.message || error || '');
-  if (/no such table/i.test(text)) return new PublicError('D1 table "traffic" is missing; run schema.sql on the bound database', 503);
-  if (/D1_ERROR|SQLITE|D1 /i.test(text)) return new PublicError('D1 database error; check the D1 binding and its database', 503);
-  return error;
+const UUID_LOG_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+function redact(value, limit = 500) {
+  return String(value ?? '').replace(UUID_LOG_RE, '<uuid>').slice(0, limit);
 }
 
-function logError(error, request) {
+// Map storage failures to clear, non-secret messages. The original error is kept
+// on .cause so logs still show the D1 diagnostic after the client message is replaced.
+function storageError(error) {
+  if (error instanceof PublicError) return error;
+  const text = String(error?.message || error || '');
+  let message = '';
+  if (/no such table/i.test(text)) message = 'D1 table "traffic" is missing; run schema.sql on the bound database';
+  else if (/D1_ERROR|SQLITE_|SQLITE |D1_TYPE|D1 /i.test(text)) message = 'D1 database error; check the D1 binding and its database';
+  if (!message) return error;
+  const wrapped = new PublicError(message, 503);
+  wrapped.cause = error;
+  return wrapped;
+}
+
+function logError(error, request, event = 'request_failed') {
   try {
     const known = error instanceof PublicError;
     let path = '';
-    try { path = new URL(request.url).pathname.replace(/^\/[^/]+/, '/<uuid>'); } catch {}
-    // UUID is redacted from the path; stack is logged only for unexpected errors so Workers Logs show the real cause.
-    console.error(JSON.stringify({ event: 'request_failed', known, path,
-      name: error?.name, message: String(error?.message || error).slice(0, 500),
-      ...(known ? {} : { stack: String(error?.stack || '').slice(0, 2000) }) }));
+    try { path = redact(new URL(request.url).pathname.replace(/^\/[^/]+/, '/<uuid>'), 300); } catch {}
+    const cause = error?.cause;
+    // Path, message, cause and stack are scrubbed of UUID-shaped strings.
+    console.error(JSON.stringify({ event, known, path,
+      name: error?.name, message: redact(error?.message || error),
+      ...(cause ? { cause: redact(cause?.message || cause) } : {}),
+      ...(known ? {} : { stack: redact(error?.stack, 2000) }) }));
   } catch {}
 }
 
 function errorResponse(error) {
   try {
     const known = error instanceof PublicError;
-    return response(known ? error.message : 'Service temporarily unavailable', known ? error.status : 503);
+    const status = known ? error.status : 503;
+    return response(known ? error.message : 'Service temporarily unavailable', status >= 400 && status <= 599 ? status : 503);
   } catch {
     return new Response('Service temporarily unavailable', { status: 503 });
+  }
+}
+
+// HEAD must not carry a body. Copy the headers a GET would have sent.
+function asHead(request, res) {
+  try {
+    if (!request || request.method !== 'HEAD' || !res || res.status === 101) return res;
+    const headers = new Headers(res.headers);
+    headers.delete('content-length');
+    return new Response(null, { status: res.status, statusText: res.statusText, headers });
+  } catch {
+    return res || new Response('Service temporarily unavailable', { status: 503 });
   }
 }
 
@@ -171,15 +201,27 @@ function errorResponse(error) {
 function database(env) {
   const d1 = env.D1;
   if (!d1 || typeof d1.prepare !== 'function') throw new PublicError('D1 binding required for quota enforcement; bind a D1 database named "D1"', 503);
-  return typeof d1.withSession === 'function' ? d1.withSession('first-primary') : d1;
+  if (typeof d1.withSession !== 'function') return d1;
+  try {
+    const session = d1.withSession('first-primary');
+    if (!session || typeof session.prepare !== 'function') return d1;
+    return session;
+  } catch (error) {
+    const mapped = storageError(error);
+    if (mapped instanceof PublicError) throw mapped;
+    const wrapped = new PublicError('D1 database error; check the D1 binding and its database', 503);
+    wrapped.cause = error;
+    throw wrapped;
+  }
 }
 
 async function handleRequest(request, env, ctx) {
   if (!env || typeof env !== 'object') throw new PublicError('Worker environment unavailable', 503);
   const cfg = readConfig(env);
   const url = new URL(request.url);
-  const ws = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
   if (request.method !== 'GET' && request.method !== 'HEAD') return response('Method not allowed', 405, undefined, { Allow: 'GET, HEAD' });
+  // A tunnel is only a GET upgrade. HEAD with Upgrade must not return 101.
+  const ws = request.method === 'GET' && request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
   const parts = url.pathname.split('/');
   const kind = parts[2] || '';
   if (ws) {
@@ -221,7 +263,13 @@ async function handleRequest(request, env, ctx) {
 const QR_TARGETS = new Set(['ty', 'cl', 'sb', 'pty', 'pcl', 'psb']);
 function qrResponse(cfg, url, target) {
   if (!QR_TARGETS.has(target) && parseSingleNode(target) < 0) return response('Not found', 404);
-  return response(qrToSVG(url.origin + '/' + cfg.uuid + '/' + target), 200, 'image/svg+xml; charset=utf-8',
+  let svg;
+  try { svg = qrToSVG(url.origin + '/' + cfg.uuid + '/' + target); }
+  catch (error) {
+    if (String(error?.message || '').includes('too long')) throw new PublicError('Subscription link is too long to encode as a QR code', 400);
+    throw error;
+  }
+  return response(svg, 200, 'image/svg+xml; charset=utf-8',
     { 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'" });
 }
 
@@ -229,10 +277,11 @@ export default {
   // Every path is caught here: errors become clear 4xx/5xx responses instead of Cloudflare error 1101.
   async fetch(request, env, ctx) {
     try {
-      return await handleRequest(request, env, ctx);
+      return asHead(request, await handleRequest(request, env, ctx));
     } catch (error) {
       logError(error, request);
-      return errorResponse(error);
+      try { return asHead(request, errorResponse(error)); }
+      catch { return new Response('Service temporarily unavailable', { status: 503 }); }
     }
   }
 };
@@ -271,9 +320,17 @@ export function parseVless(data, uuid) {
   return { host, port, dns: command === 2, payload: data.subarray(p) };
 }
 
-/** @param {any} data ArrayBuffer or ArrayBufferView */
+/** Copy the frame. consume() awaits D1, and the runtime may reuse the original buffer after the listener returns. */
 function toBytes(data) {
-  return data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  const view = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  return view.slice();
+}
+
+// Close reasons are limited to 123 bytes. A too-long reason makes ws.close() throw.
+function closeReason(reason) {
+  let text = String(reason || 'Connection closed');
+  while (text && encoder.encode(text).length > 123) text = text.slice(0, -1);
+  return text || 'Connection closed';
 }
 
 function concat(a, b) {
@@ -302,18 +359,33 @@ function openTunnel(request, cfg, db, ctx) {
   function stop(code = 1000, reason = 'Connection closed') {
     if (stopped) return;
     stopped = true;
-    clearTimeout(expiryTimer); clearTimeout(idleTimer); abort.abort();
-    if (socket) void socket.close().catch(() => {});
-    try { ws.close(code, reason); } catch {}
+    try { clearTimeout(expiryTimer); clearTimeout(idleTimer); } catch {}
+    try { abort.abort(); } catch {}
+    try {
+      if (socket && typeof socket.close === 'function') void Promise.resolve(socket.close()).catch(() => {});
+    } catch {}
+    try { ws.close(code, closeReason(reason)); } catch {}
   }
-  function touch() { clearTimeout(idleTimer); idleTimer = setTimeout(() => stop(1000, 'Idle timeout'), 120000); }
+  function touch() {
+    try { clearTimeout(idleTimer); } catch {}
+    try { idleTimer = setTimeout(() => { try { stop(1000, 'Idle timeout'); } catch {} }, 120000); } catch {}
+  }
   function scheduleExpiry() {
-    const left = cfg.expires - Date.now();
-    if (left <= 0) return stop(1008, 'Subscription expired');
-    expiryTimer = setTimeout(scheduleExpiry, Math.min(left, 2147483647));
+    try {
+      const left = cfg.expires - Date.now();
+      if (left <= 0) return stop(1008, 'Subscription expired');
+      expiryTimer = setTimeout(() => { try { scheduleExpiry(); } catch {} }, Math.min(left, 2147483647));
+    } catch {}
   }
   function fail(error) {
-    stop(error instanceof PublicError ? 1008 : 1011, error instanceof PublicError ? error.message : 'Upstream or accounting failure');
+    try {
+      if (!(error instanceof PublicError)) logError(error, request, 'tunnel_failed');
+      stop(error instanceof PublicError ? 1008 : 1011, error instanceof PublicError ? error.message : 'Upstream or accounting failure');
+    } catch {}
+  }
+  function keep(promise) {
+    try { ctx.waitUntil(promise); }
+    catch (error) { logError(error, request); }
   }
   async function authorize(n) {
     if (stopped) throw new PublicError('Connection closed');
@@ -337,9 +409,12 @@ function openTunnel(request, cfg, db, ctx) {
     let connect;
     try { ({ connect } = await import('cloudflare:sockets')); }
     catch { throw new PublicError('TCP sockets unavailable in this runtime', 503); }
+    if (typeof connect !== 'function') throw new PublicError('TCP sockets unavailable in this runtime', 503);
     const candidate = connect({ hostname: host, port });
     socket = candidate;
-    void candidate.closed.catch(() => {});
+    try {
+      if (candidate?.closed && typeof candidate.closed.then === 'function') void Promise.resolve(candidate.closed).catch(() => {});
+    } catch {}
     let timer;
     try {
       await Promise.race([candidate.opened, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Connect timeout')), 10000); })]);
@@ -366,7 +441,7 @@ function openTunnel(request, cfg, db, ctx) {
         stop();
       } finally { reader.releaseLock(); }
     })().catch(fail);
-    try { ctx.waitUntil(pump); } catch {}
+    keep(pump);
   }
   async function dnsData(bytes) {
     dnsBuffer = concat(dnsBuffer, bytes);
@@ -378,7 +453,7 @@ function openTunnel(request, cfg, db, ctx) {
       dnsBuffer = dnsBuffer.slice(length + 2);
       await authorize(packet.length);
       const controller = new AbortController();
-      const cancel = () => controller.abort();
+      const cancel = () => { try { controller.abort(); } catch {} };
       abort.signal.addEventListener('abort', cancel, { once: true });
       const timer = setTimeout(cancel, 10000);
       try {
@@ -423,21 +498,27 @@ function openTunnel(request, cfg, db, ctx) {
     const isBlob = typeof Blob !== 'undefined' && data instanceof Blob;
     if (!isBlob && !(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data)) return stop(1003, 'Binary frames required');
     const size = isBlob ? data.size : /** @type {ArrayBufferView | ArrayBuffer} */ (data).byteLength;
+    if (!Number.isSafeInteger(size) || size < 0) return stop(1003, 'Binary frames required');
     if (pending + size > MAX_QUEUE) return stop(1009, 'Receive queue limit exceeded');
     pending += size;
-    // Blob bytes are read inside the chain so frame order is preserved.
-    const bytes = async () => isBlob ? new Uint8Array(await data.arrayBuffer()) : toBytes(data);
-    chain = chain.then(async () => consume(await bytes())).catch(fail).finally(() => { pending -= size; });
-    try { ctx.waitUntil(chain); } catch {}
+    // ArrayBuffer views are copied now. Blob bytes are read inside the chain so frame order stays intact.
+    const immediate = isBlob ? null : toBytes(data);
+    chain = chain.then(async () => consume(immediate || new Uint8Array(await /** @type {Blob} */ (data).arrayBuffer()))).catch(fail).finally(() => { pending -= size; });
+    keep(chain);
   }
 
-
-  // Event listeners must never throw: an exception here would surface as an uncaught Worker exception.
-  ws.addEventListener('message', event => { try { enqueue(event.data); } catch (error) { fail(error); } });
-  ws.addEventListener('close', () => stop());
-  ws.addEventListener('error', () => stop(1011, 'WebSocket error'));
-  scheduleExpiry(); touch();
-  if (early.length) enqueue(early);
+  function listen(type, fn) {
+    ws.addEventListener(type, event => { try { fn(event); } catch (error) { fail(error); } });
+  }
+  // Listeners must not throw. On this compatibility date a thrown listener is reported
+  // as an uncaught exception instead of propagating into the caller's try/catch.
+  try {
+    listen('message', event => enqueue(event.data));
+    listen('close', () => stop());
+    listen('error', () => stop(1011, 'WebSocket error'));
+    scheduleExpiry(); touch();
+    if (early.length) enqueue(early);
+  } catch (error) { fail(error); }
   return new Response(null, { status: 101, webSocket: client });
 }
 

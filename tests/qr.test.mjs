@@ -81,4 +81,5 @@ test('handler never throws: missing env, broken D1 and missing table give clear 
   assert.equal(r3.status, 503); assert.match(await r3.text(), /EXPIRE_DATE/);
   const head = await worker.fetch(new Request('https://worker.example/' + UUID + '/usage', { method: 'HEAD' }), env(), context());
   assert.equal(head.status, 200);
+  assert.equal(await head.text(), '');
 });

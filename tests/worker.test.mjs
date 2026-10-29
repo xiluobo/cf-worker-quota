@@ -122,7 +122,12 @@ test('HTML escapes labels and exposes no external scripts; unknown routes do not
 
 test('missing/broken D1 fails closed; expired usage remains inspectable', async () => {
   assert.equal((await request(env({ D1: null }))).status, 503);
-  assert.equal((await request(env({ D1: { withSession() { throw new Error('DB outage'); } } }))).status, 503);
+  const outage = await request(env({ D1: {
+    prepare() { return { bind() { return { async first() { throw new Error('DB outage'); } }; } }; },
+    withSession() { throw new Error('DB outage'); }
+  } }));
+  assert.equal(outage.status, 503);
+  assert.match(await outage.text(), /D1/);
   const res = await request(env({ EXPIRE_DATE: '2000-01-01' }), '/usage');
   assert.equal(res.status, 200); assert.equal((await res.json()).expired, true);
 });
@@ -278,4 +283,22 @@ test('binary frames delivered as Blob (compat >= 2026-03-17) are accepted in ord
   await until(() => ws.sent.length >= 2 && ws.sent.flatMap(b => [...b]).length === 8);
   assert.deepEqual(ws.sent.slice(1).flatMap(b => [...b]), [1,2,3]);
   ws.close(); await Promise.allSettled(ctx.promises);
+});
+
+test('HEAD does not open a tunnel or return a body; logs redact UUIDs', async () => {
+  const head = await worker.fetch(new Request('https://worker.example/' + UUID + '/usage', { method: 'HEAD' }), env(), context());
+  assert.equal(head.status, 200);
+  assert.equal(await head.text(), '');
+  assert.match(head.headers.get('Content-Type'), /application\/json/);
+  const upgraded = await worker.fetch(new Request('https://worker.example/', { method: 'HEAD', headers: { Upgrade: 'websocket' } }), env(), context());
+  assert.notEqual(upgraded.status, 101);
+  const errors = [];
+  const original = console.error;
+  console.error = (...args) => { errors.push(args.join(' ')); };
+  try {
+    const boom = await worker.fetch(new Request('https://worker.example/' + UUID + '/usage'), { UUID, D1: { prepare() { throw new Error('boom ' + UUID); } } }, context());
+    assert.equal(boom.status, 503);
+    assert.equal(await boom.text(), 'Service temporarily unavailable');
+  } finally { console.error = original; }
+  assert.ok(errors.some(line => line.includes('request_failed') && line.includes('<uuid>') && !line.includes(UUID)));
 });
