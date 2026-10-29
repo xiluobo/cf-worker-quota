@@ -112,7 +112,7 @@ test('HTML escapes labels and exposes no external scripts; unknown routes do not
   const res = await request(e);
   const html = await res.text();
   assert.equal(res.status, 200);
-  assert.ok(html.includes('&lt;img')); assert.ok(!html.includes('<img'));
+  assert.ok(html.includes('&lt;img')); assert.ok(!html.includes('<img src=x'));
   assert.match(res.headers.get('Content-Security-Policy'), /frame-ancestors 'none'/);
   const calls = e.D1.calls;
   assert.equal((await worker.fetch(new Request('https://worker.example/'), e, context())).status, 404);
@@ -263,4 +263,19 @@ test('accounting failures, text frames and excessive buffers close the tunnel', 
   await Promise.allSettled(first.ctx.promises);
   const text = await tunnel(env()); text.ws.receive('hello'); assert.equal(text.ws.code, 1003);
   const big = await tunnel(env()); big.ws.receive(new Uint8Array(2*1024**2+1)); assert.equal(big.ws.code, 1009);
+});
+
+test('binary frames delivered as Blob (compat >= 2026-03-17) are accepted in order; binaryType forced to arraybuffer', async () => {
+  globalThis.__connect = echoConnect;
+  const e = env(); const { res, ws, ctx } = await tunnel(e);
+  assert.equal(res.status, 101);
+  assert.equal(ws.binaryType, 'arraybuffer');
+  const first = packet(UUID, [7,8,9]);
+  ws.receive(new Blob([first.slice(0, 5)])); ws.receive(new Blob([first.slice(5)]));
+  await until(() => ws.sent.length === 1);
+  assert.deepEqual([...ws.sent[0]], [0,0,7,8,9]); assert.equal(e.D1.used(), 6);
+  ws.receive(new Blob([new Uint8Array([1,2])])); ws.receive(new Uint8Array([3]).buffer);
+  await until(() => ws.sent.length >= 2 && ws.sent.flatMap(b => [...b]).length === 8);
+  assert.deepEqual(ws.sent.slice(1).flatMap(b => [...b]), [1,2,3]);
+  ws.close(); await Promise.allSettled(ctx.promises);
 });

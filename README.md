@@ -51,6 +51,7 @@
 | `/UUID/psb` | Sing-box 配置，仅 TLS |
 | `/UUID/usage` | 使用量 JSON，字节总量与到期状态 |
 | `/UUID/n1`…`/UUID/n13` | 单节点订阅（Base64 单条 VLESS 链接），n 后数字对应 13 个节点序号 |
+| `/UUID/qr/<ty\|cl\|sb\|pty\|pcl\|psb\|n1…n13>` | 对应订阅链接的二维码（SVG），展示页按需懒加载，不访问 D1 |
 | `/` 或 `/ws` + WebSocket Upgrade | 代理连接入口，使用协议内 UUID 验证；原 `/?ed=2560` 路径继续支持 |
 
 节点名称含实时流量与到期日：每次拉取订阅时，节点名按当时用量现算，格式为 `国家-序号 | 剩xx.xxG | 到期日`，例如 `美国🇺🇸-1 | 剩45.23G | 2026-12-31`。单节点订阅和六种组合订阅的节点名都带这个格式。展示页的"单节点订阅"区列出全部 13 个节点各自的订阅链接和节点直链。
@@ -58,6 +59,17 @@
 普通根路径和未知路径返回 404，不再公开 `request.cf`。订阅链接包含连接凭据，请仅分享给允许使用该节点的人。
 
 Clash 配置使用 JSON 表达（JSON 也是合法 YAML），保留自动选择、负载均衡、手动选择及国内直连。Sing-box 使用新 DNS 服务器格式及路由动作，面向 1.12+ 配置格式；原来的旧 DNS/FakeIP、旧入站 sniff 字段已移除。不同客户端集成版本可能有差异，应在客户端导入验证。自动测速会产生真实代理流量。
+
+## 故障排查（Error 1101 / 503）
+
+- 入口 `fetch` 捕获所有异常，不会再以 Cloudflare **Error 1101** 结束；配置或存储问题会返回 4xx/5xx 纯文本说明，例如：
+  - `Configure one valid UUID v4 in UUID` → 在 Worker 设置中添加 `UUID`（或 `uuid`）变量/密钥；
+  - `D1 binding required ...` → 绑定名为 `D1` 的 D1 数据库；
+  - `D1 table "traffic" is missing; run schema.sql ...` → 在该数据库控制台执行 `schema.sql`；
+  - `Invalid EXPIRE_DATE` / `Invalid TOTAL_TRAFFIC` 等 → 修正对应变量。
+- 未预期的错误会以 JSON（含 stack，不含 UUID）写入 Workers Logs；部署脚本已开启 `observability`。也可用 `npx wrangler tail cf-worker-quota` 实时查看。
+- 如果仍看到 1101：说明访问的不是本仓库最新部署（例如控制台手动粘贴的旧代码、另一个账号下的同名 Worker，或自定义域名路由指向了别的 Worker）。工作流在未设置 `CLOUDFLARE_ACCOUNT_ID` 变量时会回退到写死的账号 ID，请确认它就是你访问的那个账号。
+- 兼容性日期 ≥ 2026-03-17 时，Workers 默认把 WebSocket 二进制帧作为 `Blob` 交付；本 Worker 已在 `accept()` 前设置 `binaryType = 'arraybuffer'` 并兼容 `Blob`，否则代理连接会被立即以 1003 关闭。
 
 ## 配额与计费口径
 

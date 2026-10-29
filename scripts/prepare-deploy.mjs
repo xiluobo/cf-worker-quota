@@ -19,7 +19,7 @@ export function buildConfig(settings, account) {
   }
   return {
     name: WORKER_NAME, main: DEPLOY_ENTRY, account_id: account,
-    compatibility_date: '2026-09-30', keep_vars: true,
+    compatibility_date: '2026-09-30', keep_vars: true, observability: { enabled: true },
     ...(settings.compatibility_flags?.length ? { compatibility_flags: settings.compatibility_flags } : {}),
     d1_databases: databases.map(b => ({ binding: b.name, database_id: b.id }))
   };
@@ -35,7 +35,7 @@ export function buildBootstrapConfig(account, databaseId) {
   }
   return {
     name: WORKER_NAME, main: DEPLOY_ENTRY, account_id: account,
-    compatibility_date: '2026-09-30', keep_vars: true,
+    compatibility_date: '2026-09-30', keep_vars: true, observability: { enabled: true },
     d1_databases: [{ binding: 'D1', database_id: databaseId }]
   };
 }

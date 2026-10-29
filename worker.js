@@ -1,10 +1,10 @@
 // VLESS over WebSocket; derived from the user-provided GAMFC/43fad05 source.
 // Strict quota mode: persist authorized payload bytes BEFORE forwarding them.
 // UUID and D1 are required. Run schema.sql once before deployment.
-// NOTE: cloudflare:sockets is imported lazily inside openSocket only. A static
-// import would fail module evaluation (Error 1101 on every request) on runtimes
-// where the sockets module is unavailable, even for plain HTTP subscription
-// requests that never open a TCP connection.
+// NOTE: cloudflare:sockets is imported lazily inside openSocket only, so plain
+// HTTP routes never depend on it. The fetch handler catches every error and
+// returns a clear 4xx/5xx text response; unexpected errors are logged with a
+// stack trace to Workers Logs instead of surfacing as Cloudflare error 1101.
 
 const GIB = 1024 ** 3;
 const MAX_QUEUE = 2 * 1024 ** 2;
@@ -17,7 +17,7 @@ const DEFAULT_PORTS = [80, 8080, 8880, 2052, 2082, 2086, 2095, 443, 8443, 2053, 
 const TYPES = new Set(['', 'ty', 'pty', 'cl', 'pcl', 'sb', 'psb', 'usage']);
 
 class PublicError extends Error {
-  constructor(message, status = 400) { super(message); this.status = status; }
+  constructor(message, status = 400) { super(message); this.name = 'PublicError'; this.status = status; }
 }
 
 export function validHost(value) {
@@ -138,50 +138,101 @@ export async function charge(db, cfg, bytes) {
   if (!row) throw new PublicError('Quota exhausted', 403);
 }
 
+// Map storage failures to clear, non-secret messages. Anything else stays generic.
+function storageError(error) {
+  const text = String(error?.message || error || '');
+  if (/no such table/i.test(text)) return new PublicError('D1 table "traffic" is missing; run schema.sql on the bound database', 503);
+  if (/D1_ERROR|SQLITE|D1 /i.test(text)) return new PublicError('D1 database error; check the D1 binding and its database', 503);
+  return error;
+}
+
+function logError(error, request) {
+  try {
+    const known = error instanceof PublicError;
+    let path = '';
+    try { path = new URL(request.url).pathname.replace(/^\/[^/]+/, '/<uuid>'); } catch {}
+    // UUID is redacted from the path; stack is logged only for unexpected errors so Workers Logs show the real cause.
+    console.error(JSON.stringify({ event: 'request_failed', known, path,
+      name: error?.name, message: String(error?.message || error).slice(0, 500),
+      ...(known ? {} : { stack: String(error?.stack || '').slice(0, 2000) }) }));
+  } catch {}
+}
+
+function errorResponse(error) {
+  try {
+    const known = error instanceof PublicError;
+    return response(known ? error.message : 'Service temporarily unavailable', known ? error.status : 503);
+  } catch {
+    return new Response('Service temporarily unavailable', { status: 503 });
+  }
+}
+
+// D1 sessions keep quota reads on the primary; fall back to the plain binding if unsupported.
+function database(env) {
+  const d1 = env.D1;
+  if (!d1 || typeof d1.prepare !== 'function') throw new PublicError('D1 binding required for quota enforcement; bind a D1 database named "D1"', 503);
+  return typeof d1.withSession === 'function' ? d1.withSession('first-primary') : d1;
+}
+
+async function handleRequest(request, env, ctx) {
+  if (!env || typeof env !== 'object') throw new PublicError('Worker environment unavailable', 503);
+  const cfg = readConfig(env);
+  const url = new URL(request.url);
+  const ws = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
+  if (request.method !== 'GET' && request.method !== 'HEAD') return response('Method not allowed', 405, undefined, { Allow: 'GET, HEAD' });
+  const parts = url.pathname.split('/');
+  const kind = parts[2] || '';
+  if (ws) {
+    if (url.pathname !== '/' && url.pathname !== '/ws') return response('Not found', 404); // Client-supplied ProxyIP overrides are deliberately removed.
+  } else {
+    if (parts.length < 2 || !equalUUID(parts[1], cfg.uuid)) return response('Not found', 404);
+    // QR images are rendered on demand so the page itself stays cheap (Free plan CPU limit).
+    if (kind === 'qr' && parts.length === 4) return qrResponse(cfg, url, parts[3]);
+    if (parts.length > 3 || (!TYPES.has(kind) && parseSingleNode(kind) < 0)) return response('Not found', 404);
+  }
+  const db = database(env);
+  let usage;
+  try { usage = await getUsage(db, cfg); } catch (error) { throw storageError(error); }
+  if (ws) {
+    if (usage.expired || usage.exhausted) return response(usage.expired ? 'Subscription expired' : 'Quota exhausted', 403);
+    if (!ctx || typeof ctx.waitUntil !== 'function') throw new PublicError('Execution context unavailable', 503);
+    return openTunnel(request, cfg, db, ctx);
+  }
+  if (kind === 'usage') return response(JSON.stringify(usage), 200, 'application/json; charset=utf-8');
+  const host = url.hostname;
+  const headers = {
+    // Legacy usage has no directional split. Report its aggregate as download.
+    'Subscription-Userinfo': `upload=0; download=${usage.used}; total=${cfg.total}; expire=${Math.floor(cfg.expires / 1000)}`,
+    'Profile-Update-Interval': '6', 'Profile-Title': 'base64:' + utf8Base64(cfg.country + ' | 剩' + (usage.remaining / GIB).toFixed(2) + 'G | ' + new Date(cfg.expires).toISOString().slice(0, 10)),
+    'Profile-Web-Page-Url': url.origin + '/' + cfg.uuid
+  };
+  // Node names are plain country-flag names; node host/port/tls unchanged.
+  const displayNodes = withDisplayNames(cfg.nodes);
+  if (!kind) return renderPage(cfg, usage, url.origin, displayNodes);
+  const single = parseSingleNode(kind);
+  if (single >= 0) return response(utf8Base64(vlessURI(cfg, host, displayNodes[single])), 200, undefined, headers);
+  const nodes = displayNodes.filter(n => !(cfg.tlsOnly || kind.startsWith('p')) || n.tls);
+  if (kind.endsWith('ty')) return response(utf8Base64(nodes.map(n => vlessURI(cfg, host, n)).join('\n')), 200, undefined, headers);
+  if (kind.endsWith('cl')) return response(clashConfig(cfg, host, nodes), 200, 'text/yaml; charset=utf-8', headers);
+  return response(JSON.stringify(singboxConfig(cfg, host, nodes), null, 2), 200, 'application/json; charset=utf-8', headers);
+}
+
+// /UUID/qr/<ty|cl|sb|pty|pcl|psb|n1..n13> -> SVG QR code of that subscription link. No D1 access.
+const QR_TARGETS = new Set(['ty', 'cl', 'sb', 'pty', 'pcl', 'psb']);
+function qrResponse(cfg, url, target) {
+  if (!QR_TARGETS.has(target) && parseSingleNode(target) < 0) return response('Not found', 404);
+  return response(qrToSVG(url.origin + '/' + cfg.uuid + '/' + target), 200, 'image/svg+xml; charset=utf-8',
+    { 'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'" });
+}
+
 export default {
+  // Every path is caught here: errors become clear 4xx/5xx responses instead of Cloudflare error 1101.
   async fetch(request, env, ctx) {
     try {
-      const cfg = readConfig(env);
-      const url = new URL(request.url);
-      const ws = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
-      if (request.method !== 'GET') return response('Method not allowed', 405, undefined, { Allow: 'GET' });
-      if (!ws) {
-        const parts = url.pathname.split('/');
-        const kind = parts[2] || '';
-        if (parts.length < 2 || parts.length > 3 || !equalUUID(parts[1], cfg.uuid) || (!TYPES.has(kind) && parseSingleNode(kind) < 0)) return response('Not found', 404);
-      } else if (url.pathname !== '/' && url.pathname !== '/ws') {
-        return response('Not found', 404); // Client-supplied ProxyIP overrides are deliberately removed.
-      }
-      if (!env.D1) throw new PublicError('D1 binding required for quota enforcement', 503);
-      // Primary-constrained reads avoid stale quota displays when read replication is enabled.
-      const db = env.D1.withSession('first-primary');
-      const usage = await getUsage(db, cfg);
-      if (ws) {
-        if (usage.expired || usage.exhausted) return response(usage.expired ? 'Subscription expired' : 'Quota exhausted', 403);
-        return openTunnel(request, cfg, db, ctx);
-      }
-      const kind = url.pathname.split('/')[2] || '';
-      if (kind === 'usage') return response(JSON.stringify(usage), 200, 'application/json; charset=utf-8');
-      const host = url.hostname;
-      const headers = {
-        // Legacy usage has no directional split. Report its aggregate as download.
-        'Subscription-Userinfo': `upload=0; download=${usage.used}; total=${cfg.total}; expire=${Math.floor(cfg.expires / 1000)}`,
-        'Profile-Update-Interval': '6', 'Profile-Title': 'base64:' + utf8Base64(cfg.country + ' | 剩' + (usage.remaining / GIB).toFixed(2) + 'G | ' + new Date(cfg.expires).toISOString().slice(0, 10)),
-        'Profile-Web-Page-Url': url.origin + '/' + cfg.uuid
-      };
-      // Node names are plain country-flag names; node host/port/tls unchanged.
-      const displayNodes = withDisplayNames(cfg.nodes);
-      if (!kind) return renderPage(cfg, usage, url.origin, displayNodes);
-      const single = parseSingleNode(kind);
-      if (single >= 0) return response(utf8Base64(vlessURI(cfg, host, displayNodes[single])), 200, undefined, headers);
-      const nodes = displayNodes.filter(n => !(cfg.tlsOnly || kind.startsWith('p')) || n.tls);
-      if (kind.endsWith('ty')) return response(utf8Base64(nodes.map(n => vlessURI(cfg, host, n)).join('\n')), 200, undefined, headers);
-      if (kind.endsWith('cl')) return response(clashConfig(cfg, host, nodes), 200, 'text/yaml; charset=utf-8', headers);
-      return response(JSON.stringify(singboxConfig(cfg, host, nodes), null, 2), 200, 'application/json; charset=utf-8', headers);
+      return await handleRequest(request, env, ctx);
     } catch (error) {
-      const known = error instanceof PublicError;
-      console.error(JSON.stringify({ event: 'request_failed', category: known ? error.message : 'storage_or_runtime_error' }));
-      return response(known ? error.message : 'Service temporarily unavailable', known ? error.status : 503);
+      logError(error, request);
+      return errorResponse(error);
     }
   }
 };
@@ -220,6 +271,11 @@ export function parseVless(data, uuid) {
   return { host, port, dns: command === 2, payload: data.subarray(p) };
 }
 
+/** @param {any} data ArrayBuffer or ArrayBufferView */
+function toBytes(data) {
+  return data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+}
+
 function concat(a, b) {
   const out = new Uint8Array(a.length + b.length); out.set(a); out.set(b, a.length); return out;
 }
@@ -235,6 +291,9 @@ function openTunnel(request, cfg, db, ctx) {
   const early = decodeEarlyData(request.headers.get('sec-websocket-protocol'));
   const pair = new WebSocketPair();
   const client = pair[0], ws = pair[1];
+  // Compatibility dates >= 2026-03-17 deliver binary frames as Blob by default
+  // (websocket_standard_binary_type). Ask for ArrayBuffer before accept(); Blob is still handled below.
+  try { ws.binaryType = 'arraybuffer'; } catch {}
   ws.accept();
   let stopped = false, pending = 0, header = new Uint8Array(), dnsBuffer = new Uint8Array();
   let destination = null, socket = null, writer = null, sentHeader = false;
@@ -275,7 +334,9 @@ function openTunnel(request, cfg, db, ctx) {
   async function openSocket(host, port) {
     // Lazy import: only WebSocket tunnel requests need TCP sockets. HTTP
     // subscription/page/usage requests must never fail on this import.
-    const { connect } = await import('cloudflare:sockets');
+    let connect;
+    try { ({ connect } = await import('cloudflare:sockets')); }
+    catch { throw new PublicError('TCP sockets unavailable in this runtime', 503); }
     const candidate = connect({ hostname: host, port });
     socket = candidate;
     void candidate.closed.catch(() => {});
@@ -305,7 +366,7 @@ function openTunnel(request, cfg, db, ctx) {
         stop();
       } finally { reader.releaseLock(); }
     })().catch(fail);
-    ctx.waitUntil(pump);
+    try { ctx.waitUntil(pump); } catch {}
   }
   async function dnsData(bytes) {
     dnsBuffer = concat(dnsBuffer, bytes);
@@ -356,16 +417,23 @@ function openTunnel(request, cfg, db, ctx) {
       await writer.write(part);
     }
   }
+  /** @param {any} data */
   function enqueue(data) {
     if (stopped) return;
-    if (!(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data)) return stop(1003, 'Binary frames required');
-    const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-    if (pending + bytes.length > MAX_QUEUE) return stop(1009, 'Receive queue limit exceeded');
-    pending += bytes.length;
-    chain = chain.then(() => consume(bytes)).catch(fail).finally(() => { pending -= bytes.length; });
-    ctx.waitUntil(chain);
+    const isBlob = typeof Blob !== 'undefined' && data instanceof Blob;
+    if (!isBlob && !(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data)) return stop(1003, 'Binary frames required');
+    const size = isBlob ? data.size : /** @type {ArrayBufferView | ArrayBuffer} */ (data).byteLength;
+    if (pending + size > MAX_QUEUE) return stop(1009, 'Receive queue limit exceeded');
+    pending += size;
+    // Blob bytes are read inside the chain so frame order is preserved.
+    const bytes = async () => isBlob ? new Uint8Array(await data.arrayBuffer()) : toBytes(data);
+    chain = chain.then(async () => consume(await bytes())).catch(fail).finally(() => { pending -= size; });
+    try { ctx.waitUntil(chain); } catch {}
   }
-  ws.addEventListener('message', event => enqueue(event.data));
+
+
+  // Event listeners must never throw: an exception here would surface as an uncaught Worker exception.
+  ws.addEventListener('message', event => { try { enqueue(event.data); } catch (error) { fail(error); } });
   ws.addEventListener('close', () => stop());
   ws.addEventListener('error', () => stop(1011, 'WebSocket error'));
   scheduleExpiry(); touch();
@@ -628,19 +696,20 @@ function renderPage(cfg, usage, origin, displayNodes) {
   const links = [['通用订阅', 'ty'], ['Clash Meta', 'cl'], ['Sing-box', 'sb'], ['通用订阅 · 仅 TLS', 'pty'], ['Clash Meta · 仅 TLS', 'pcl'], ['Sing-box · 仅 TLS', 'psb']];
   const single = [{ host: cfg.cdnip, port: 8443, tls: true, name: cfg.country }];
   if (!cfg.tlsOnly) single.push({ host: cfg.cdnip, port: 8880, tls: false, name: cfg.country });
-  const subFields = links.map(([name, suffix]) => [name, origin + '/' + cfg.uuid + '/' + suffix]);
+  const subFields = links.map(([name, suffix]) => [name, origin + '/' + cfg.uuid + '/' + suffix, suffix]);
+  const qr = target => `<details><summary>二维码</summary><img loading="lazy" width="160" height="160" alt="二维码" src="${e(origin + '/' + cfg.uuid + '/qr/' + target)}"></details>`;
   const uriFields = single.map(n => [n.tls ? '单节点 · TLS' : '单节点 · 非 TLS', vlessURI(cfg, new URL(origin).hostname, n)]);
   const host = new URL(origin).hostname;
   const nodeFields = (displayNodes || cfg.nodes).map((n, i) => ({
-    name: n.name, sub: origin + '/' + cfg.uuid + '/n' + (i + 1), uri: vlessURI(cfg, host, n)
+    name: n.name, sub: origin + '/' + cfg.uuid + '/n' + (i + 1), target: 'n' + (i + 1), uri: vlessURI(cfg, host, n)
   }));
   const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>节点与订阅</title>
-  <style nonce="${nonce}">*{box-sizing:border-box}body{font:16px/1.6 system-ui;margin:0;background:#f2f5f9;color:#172437}main{max-width:850px;margin:40px auto;padding:24px}section{background:white;padding:24px;border-radius:16px;margin:18px 0}h1{margin:0}small{color:#526273}label{display:block;margin-top:16px}input{width:calc(100% - 80px);padding:10px;border:1px solid #bcc8d7;border-radius:6px}button{margin-left:8px;padding:10px;border:0;border-radius:6px;background:#145ad3;color:white;cursor:pointer}progress{width:100%;height:18px}#notice{min-height:26px}details{margin:8px 0}summary{cursor:pointer;color:#145ad3}details svg{display:block;margin:10px 0}</style></head>
+  <style nonce="${nonce}">*{box-sizing:border-box}body{font:16px/1.6 system-ui;margin:0;background:#f2f5f9;color:#172437}main{max-width:850px;margin:40px auto;padding:24px}section{background:white;padding:24px;border-radius:16px;margin:18px 0}h1{margin:0}small{color:#526273}label{display:block;margin-top:16px}input{width:calc(100% - 80px);padding:10px;border:1px solid #bcc8d7;border-radius:6px}button{margin-left:8px;padding:10px;border:0;border-radius:6px;background:#145ad3;color:white;cursor:pointer}progress{width:100%;height:18px}#notice{min-height:26px}details{margin:8px 0}summary{cursor:pointer;color:#145ad3}details img{display:block;margin:10px 0}</style></head>
   <body><main><h1>${e(cfg.country)} · ${status}</h1><section><strong>剩余 ${(usage.remaining / GIB).toFixed(2)} GiB / ${(cfg.total / GIB).toFixed(2)} GiB</strong><progress max="${Math.max(cfg.total,1)}" value="${Math.min(usage.used,cfg.total)}"></progress><p>剩余 ${usage.remainingDays.toFixed(1)} 天 · 到期 ${e(new Date(cfg.expires).toISOString())}</p><small>额度统计上传与下载的有效载荷。请保管好这些链接；其中包含连接凭据。国家名称仅为标签。</small></section>
-  <section><h2>订阅与节点</h2>${subFields.map(([name,value],i) => `<label for="link-${i}">${e(name)}</label><input id="link-${i}" readonly value="${e(value)}"><button data-copy="link-${i}">复制</button><details><summary>二维码</summary>${qrToSVG(value)}</details>`).join('')}${uriFields.map(([name,value],i) => `<label for="uri-${i}">${e(name)}</label><input id="uri-${i}" readonly value="${e(value)}"><button data-copy="uri-${i}">复制</button>`).join('')}<p id="notice" role="status"></p></section>
-  <section><h2>单节点订阅</h2><small>每个节点单独订阅，名称含当前剩余流量与到期日。</small>${nodeFields.map((f,i) => `<label for="nsub-${i}">${e(f.name)} · 订阅</label><input id="nsub-${i}" readonly value="${e(f.sub)}"><button data-copy="nsub-${i}">复制</button><details><summary>二维码</summary>${qrToSVG(f.sub)}</details><label for="nuri-${i}">${e(f.name)} · 节点</label><input id="nuri-${i}" readonly value="${e(f.uri)}"><button data-copy="nuri-${i}">复制</button>`).join('')}</section></main>
+  <section><h2>订阅与节点</h2>${subFields.map(([name,value,target],i) => `<label for="link-${i}">${e(name)}</label><input id="link-${i}" readonly value="${e(value)}"><button data-copy="link-${i}">复制</button>${qr(target)}`).join('')}${uriFields.map(([name,value],i) => `<label for="uri-${i}">${e(name)}</label><input id="uri-${i}" readonly value="${e(value)}"><button data-copy="uri-${i}">复制</button>`).join('')}<p id="notice" role="status"></p></section>
+  <section><h2>单节点订阅</h2><small>每个节点单独订阅；剩余流量与到期日见上方及订阅标题。</small>${nodeFields.map((f,i) => `<label for="nsub-${i}">${e(f.name)} · 订阅</label><input id="nsub-${i}" readonly value="${e(f.sub)}"><button data-copy="nsub-${i}">复制</button>${qr(f.target)}<label for="nuri-${i}">${e(f.name)} · 节点</label><input id="nuri-${i}" readonly value="${e(f.uri)}"><button data-copy="nuri-${i}">复制</button>`).join('')}</section></main>
   <script nonce="${nonce}">document.addEventListener('click',async event=>{const id=event.target.dataset.copy;if(!id)return;const input=document.getElementById(id);try{await navigator.clipboard.writeText(input.value);document.getElementById('notice').textContent='已复制';}catch{input.focus();input.select();document.getElementById('notice').textContent='请按 Ctrl+C 复制';}});</script></body></html>`;
-  return response(html, 200, 'text/html; charset=utf-8', { 'Content-Security-Policy': `default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'` });
+  return response(html, 200, 'text/html; charset=utf-8', { 'Content-Security-Policy': `default-src 'none'; img-src 'self'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'` });
 }
 
 const COUNTRY_MAP = {

@@ -46,13 +46,39 @@ test('qrToSVG returns inline SVG', () => {
   assert.ok(!svg.includes('<image') && !svg.includes('href='), 'no external resource in QR svg');
 });
 
-test('page embeds QR codes for subscriptions only', async () => {
+test('page links lazy QR images for subscriptions only; QR route serves SVG without D1', async () => {
   const res = await worker.fetch(new Request('https://worker.example/' + UUID), env(), context());
   assert.equal(res.status, 200);
   const html = await res.text();
-  // 6 个组合订阅 + 13 个单节点订阅 = 19 个二维码
-  const count = (html.match(/<details><summary>二维码<\/summary><svg /g) || []).length;
+  // 6 个组合订阅 + 13 个单节点订阅 = 19 个二维码（按需加载，页面本身不再计算二维码）
+  const count = (html.match(/<details><summary>二维码<\/summary><img loading="lazy"/g) || []).length;
   assert.equal(count, 19, 'page has 19 QR codes for subscription links');
-  // 节点 URI（vless://）不带二维码，只带复制按钮
+  assert.match(res.headers.get('Content-Security-Policy'), /img-src 'self'/);
   assert.ok(html.includes('vless://'), 'page still lists node URIs');
+  const noDb = env({ D1: null });
+  for (const target of ['ty', 'cl', 'sb', 'pty', 'pcl', 'psb', 'n1', 'n13']) {
+    const qr = await worker.fetch(new Request('https://worker.example/' + UUID + '/qr/' + target), noDb, context());
+    assert.equal(qr.status, 200, target);
+    assert.match(qr.headers.get('Content-Type'), /image\/svg\+xml/);
+    const svg = await qr.text();
+    assert.equal(svg, mod.qrToSVG('https://worker.example/' + UUID + '/' + target));
+  }
+  for (const bad of ['/qr/x', '/qr/n14', '/qr/usage']) {
+    assert.equal((await worker.fetch(new Request('https://worker.example/' + UUID + bad), noDb, context())).status, 404, bad);
+  }
+  assert.equal((await worker.fetch(new Request('https://worker.example/22222222-2222-4222-8222-222222222222/qr/ty'), noDb, context())).status, 404);
+});
+
+test('handler never throws: missing env, broken D1 and missing table give clear errors', async () => {
+  const req = () => new Request('https://worker.example/' + UUID);
+  assert.equal((await worker.fetch(req(), undefined, context())).status, 503);
+  assert.equal((await worker.fetch(req(), {}, context())).status, 503);
+  const r1 = await worker.fetch(req(), { UUID, D1: { prepare() { throw new Error('D1_ERROR: no such table: traffic: SQLITE_ERROR'); } } }, context());
+  assert.equal(r1.status, 503); assert.match(await r1.text(), /schema\.sql/);
+  const r2 = await worker.fetch(req(), { UUID, D1: 'not-a-binding' }, context());
+  assert.equal(r2.status, 503); assert.match(await r2.text(), /D1/);
+  const r3 = await worker.fetch(req(), { UUID, EXPIRE_DATE: 'tomorrow', D1: new D1() }, context());
+  assert.equal(r3.status, 503); assert.match(await r3.text(), /EXPIRE_DATE/);
+  const head = await worker.fetch(new Request('https://worker.example/' + UUID + '/usage', { method: 'HEAD' }), env(), context());
+  assert.equal(head.status, 200);
 });
